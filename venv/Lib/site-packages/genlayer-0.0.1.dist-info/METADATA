@@ -1,0 +1,17 @@
+Metadata-Version: 2.4
+Name: genlayer
+Version: 0.0.1
+Summary: A minimal empty PyPI package for genlayer
+Author-email: GenLayer Labs Corp <tech@genlayer.com>
+License: MIT
+Requires-Python: >=3.6
+Description-Content-Type: text/markdown
+
+# GenLayer Python Package
+
+This is a minimal empty Python package for genlayer.
+
+## Installation
+```bash
+pip install genlayer
+```
