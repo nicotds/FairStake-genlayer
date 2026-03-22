@@ -2,7 +2,7 @@ import { type Chain } from 'viem'
 
 // GenLayer Bradbury Network Configuration
 export const bradburyChain: Chain = {
-  id: 1337, // GenLayer Bradbury Chain ID
+  id: 4221, // GenLayer Bradbury Chain ID
   name: 'GenLayer Bradbury',
   nativeCurrency: {
     decimals: 18,

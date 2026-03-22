@@ -21,7 +21,7 @@ const statusStyles: Record<BetStatus, string> = {
   [BetStatus.MATCHED]: 'bg-blue-500/20 text-blue-400 border-blue-500/30',
   [BetStatus.PROPOSED]: 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30',
   [BetStatus.DISPUTED]: 'bg-orange-500/20 text-orange-400 border-orange-500/30',
-  [BetStatus.RESOLVED]: 'bg-violet/20 text-violet border-violet/30',
+  [BetStatus.SETTLED]: 'bg-violet/20 text-violet border-violet/30',
   [BetStatus.CANCELLED]: 'bg-muted text-muted-foreground border-muted',
 }
 

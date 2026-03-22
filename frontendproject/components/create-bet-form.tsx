@@ -51,7 +51,7 @@ type CreateBetFormData = z.infer<typeof createBetSchema>
 export function CreateBetForm() {
   const router = useRouter()
   const { isConnected } = useAccount()
-  const { createBet, isWriting, isConfirming, isConfirmed } = useBetContract()
+  const { createBet, isWriting } = useBetContract()
   const [isSimulating, setIsSimulating] = useState(false)
   const [simulationResult, setSimulationResult] = useState<{ understood: boolean; reasoning: string } | null>(null)
 
@@ -312,10 +312,10 @@ export function CreateBetForm() {
           </Button>
           <Button
             type="submit"
-            disabled={!isConnected || isWriting || isConfirming}
+            disabled={!isConnected || isWriting}
             className="flex-1 bg-primary text-primary-foreground hover:bg-primary/90"
           >
-            {isWriting || isConfirming ? (
+            {isWriting ? (
               <>
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                 Creando...

@@ -1,3 +1,4 @@
+# { "Depends": "py-genlayer:test" }
 """
 FairStake — P2P Betting Smart Contract
 Platform : GenLayer (Bradbury Testnet)
@@ -11,8 +12,9 @@ State machine:
 """
 
 import json
+import datetime as _dt
 from typing import Optional
-from genlayer.std import *  # provides: gl, u256, Address, TreeMap, require
+from genlayer import *
 
 # ── Status labels ─────────────────────────────────────────────────────────────
 OPEN      = "OPEN"
@@ -24,24 +26,25 @@ CANCELLED = "CANCELLED"
 
 # ── Timing & consensus ────────────────────────────────────────────────────────
 DISPUTE_WINDOW_SECS = 300   # 5 minutes — challenge window after a proposal
-DEMOCRACY_NODES     = 3     # validators used in the Democracy Phase
 
 # ── Gas-optimisation: cap string storage to avoid unnecessary gas burn ────────
-MAX_URL_LEN      = 256   # bytes
-MAX_CRITERIA_LEN = 512   # bytes
+MAX_URL_LEN      = 256
+MAX_CRITERIA_LEN = 512
 
 # ── AI Oracle system prompt ───────────────────────────────────────────────────
-# Structured strictly to satisfy the Principle of Equivalence (temperature=0).
-# Uses double-braces {{ }} to escape the format() call.
 _ORACLE_SYSTEM_PROMPT = """\
-You are an impartial Data Verification Protocol. \
-Your only task is to verify whether a stated criteria is satisfied \
+You are an impartial Data Verification Protocol.
+Your only task is to verify whether a stated criteria is satisfied
 based on real-time data from a given web source.
 
+Web page content:
+{web_data}
+
+CRITERIA: {criteria}
+
 STRICT RULES:
-1. Fetch and read SOURCE_URL.
-2. Evaluate CRITERIA literally — no interpretation, no subjectivity.
-3. Respond ONLY with the JSON object below. No markdown, no extra text.
+1. Evaluate CRITERIA literally — no interpretation, no subjectivity.
+2. Respond ONLY with the JSON object below. No markdown, no extra text.
 
 OUTPUT SCHEMA (return exactly this structure):
 {{"winner": "maker" | "taker" | "invalid", "reason": "<one concise sentence>"}}
@@ -49,23 +52,24 @@ OUTPUT SCHEMA (return exactly this structure):
 DECISION LOGIC:
 - "maker"   → CRITERIA is EXACTLY and UNAMBIGUOUSLY satisfied.
 - "taker"   → CRITERIA is CLEARLY NOT satisfied.
-- "invalid" → URL unreachable | data ambiguous | criteria subjective | any error.
-
-SOURCE_URL : {source_url}
-CRITERIA   : {criteria}
+- "invalid" → data ambiguous | criteria subjective | any error.
 """
 
 
-class FairStake(gl.Contract):
-    """P2P Betting contract with AI-judged resolution (Reentrancy Safe)."""
+def _now_unix() -> int:
+    """Parse gl.message.datetime (ISO string) to Unix timestamp integer."""
+    dt_str = gl.message.datetime.replace("Z", "+00:00")
+    dt = _dt.datetime.fromisoformat(dt_str)
+    return int(dt.timestamp())
 
-    # ── Persistent storage ────────────────────────────────────────────────────
+
+class FairStake(gl.Contract):
+    """P2P Betting contract with AI-judged resolution."""
+
     bets:      TreeMap[u256, dict]
     bet_count: u256
 
-    # ── Constructor ───────────────────────────────────────────────────────────
     def __init__(self) -> None:
-        self.bets      = TreeMap()
         self.bet_count = u256(0)
 
     # =========================================================================
@@ -73,48 +77,39 @@ class FairStake(gl.Contract):
     # =========================================================================
 
     def _get_bet(self, bet_id: u256) -> dict:
-        require(int(bet_id) < int(self.bet_count), "Bet does not exist")
+        if int(bet_id) >= int(self.bet_count):
+            raise Exception("Bet does not exist")
         return self.bets[bet_id]
 
     def _save_bet(self, bet_id: u256, bet: dict) -> None:
         self.bets[bet_id] = bet
 
-    async def _call_oracle(self, bet: dict, *, num_validators: int = 1) -> str:
+    def _call_oracle(self, bet: dict) -> str:
         """
-        Execute the AI oracle to evaluate a bet.
-
-        Returns "maker" | "taker" | "invalid".
-
-        num_validators=1  → Optimistic Phase  (single node, fast)
-        num_validators=3+ → Democracy Phase   (multi-node consensus)
-
-        NOTE: In the GenLayer protocol, `num_validators` instructs the
-        framework on how many Intelligent Nodes must reach consensus before
-        the transaction is committed. temperature=0 enforces the
-        Principle of Equivalence (deterministic output across all nodes).
+        Execute AI oracle synchronously using gl.eq_principle_strict_eq.
+        Returns 'maker' | 'taker' | 'invalid'.
         """
-        prompt = _ORACLE_SYSTEM_PROMPT.format(
-            source_url=bet["source_url"],
-            criteria=bet["criteria"],
-        )
+        source_url = bet["source_url"]
+        criteria   = bet["criteria"]
 
-        raw = await gl.exec_prompt(
-            prompt,
-            temperature    = 0,
-            max_tokens     = 200,
-            web_resources  = [bet["source_url"]],
-            num_validators = num_validators,
-        )
+        def get_verdict() -> str:
+            web_data = gl.get_webpage(source_url, mode="text")
+            prompt = _ORACLE_SYSTEM_PROMPT.format(
+                web_data=web_data,
+                criteria=criteria,
+            )
+            result = gl.exec_prompt(prompt)
+            return json.dumps(json.loads(result), sort_keys=True)
 
         try:
-            verdict = json.loads(raw.strip())
+            raw     = gl.eq_principle_strict_eq(get_verdict)
+            verdict = json.loads(raw)
             winner  = verdict.get("winner", "invalid")
             return winner if winner in ("maker", "taker", "invalid") else "invalid"
-        except (json.JSONDecodeError, AttributeError, TypeError):
+        except Exception:
             return "invalid"
 
     def _address_of(self, bet: dict, winner_key: str) -> Optional[str]:
-        """Resolve 'maker'/'taker'/'invalid' to an actual address."""
         if winner_key == "maker":
             return bet["maker"]
         if winner_key == "taker":
@@ -126,34 +121,22 @@ class FairStake(gl.Contract):
     # =========================================================================
 
     @gl.public.write
-    def create_bet(
-        self,
-        source_url: str,
-        criteria:   str,
-        deadline:   u256,
-    ) -> u256:
-        """
-        Create a new open bet.
-        msg.value is the stake — both parties will match this exact amount.
-
-        Events emitted: BetCreated
-        """
-        # ── Validations ───────────────────────────────────────────────────────
-        require(int(gl.message.value) > 0,
-                "Stake must be greater than 0")
-        require(int(deadline) > int(gl.message.timestamp),
-                "Deadline must be in the future")
-        require(len(source_url) <= MAX_URL_LEN,
-                f"source_url exceeds {MAX_URL_LEN} chars — optimise for gas")
-        require(len(criteria) <= MAX_CRITERIA_LEN,
-                f"criteria exceeds {MAX_CRITERIA_LEN} chars — optimise for gas")
+    def create_bet(self, source_url: str, criteria: str, deadline: u256) -> u256:
+        """Create a new open bet. msg.value is the stake."""
+        if int(gl.message.value) <= 0:
+            raise Exception("Stake must be greater than 0")
+        if int(deadline) <= _now_unix():
+            raise Exception("Deadline must be in the future")
+        if len(source_url) > MAX_URL_LEN:
+            raise Exception(f"source_url exceeds {MAX_URL_LEN} chars")
+        if len(criteria) > MAX_CRITERIA_LEN:
+            raise Exception(f"criteria exceeds {MAX_CRITERIA_LEN} chars")
 
         bet_id = self.bet_count
 
-        # ── Effects ───────────────────────────────────────────────────────────
         bet: dict = {
             "id":              int(bet_id),
-            "maker":           str(gl.message.sender),
+            "maker":           str(gl.message.sender_address),
             "taker":           None,
             "amount":          int(gl.message.value),
             "source_url":      source_url,
@@ -165,239 +148,117 @@ class FairStake(gl.Contract):
         }
         self._save_bet(bet_id, bet)
         self.bet_count = u256(int(bet_id) + 1)
-
-        # ── Event ─────────────────────────────────────────────────────────────
-        gl.emit_event("BetCreated", {
-            "bet_id":   int(bet_id),
-            "maker":    str(gl.message.sender),
-            "amount":   int(gl.message.value),
-            "deadline": int(deadline),
-        })
-
         return bet_id
-
-    # ─────────────────────────────────────────────────────────────────────────
 
     @gl.public.write
     def join_bet(self, bet_id: u256) -> None:
-        """
-        Taker joins an open bet.
-        msg.value must match the Maker's stake exactly (1v1 parity).
-        Taker cannot be the same address as the Maker.
-
-        Events emitted: BetMatched
-        """
+        """Taker joins an open bet with matching stake."""
         bet = self._get_bet(bet_id)
 
-        # ── Validations ───────────────────────────────────────────────────────
-        require(bet["status"] == OPEN,
-                "Bet is not open for joining")
-        require(str(gl.message.sender) != bet["maker"],
-                "Maker cannot join their own bet as Taker")
-        require(int(gl.message.value) == bet["amount"],
-                "msg.value must match the bet amount exactly")
-        require(int(gl.message.timestamp) < bet["deadline"],
-                "Bet deadline has already passed")
+        if bet["status"] != OPEN:
+            raise Exception("Bet is not open for joining")
+        if str(gl.message.sender_address) == bet["maker"]:
+            raise Exception("Maker cannot join their own bet as Taker")
+        if int(gl.message.value) != bet["amount"]:
+            raise Exception("msg.value must match the bet amount exactly")
+        if _now_unix() >= bet["deadline"]:
+            raise Exception("Bet deadline has already passed")
 
-        # ── Effects ───────────────────────────────────────────────────────────
-        bet["taker"]  = str(gl.message.sender)
+        bet["taker"]  = str(gl.message.sender_address)
         bet["status"] = MATCHED
         self._save_bet(bet_id, bet)
 
-        # ── Event ─────────────────────────────────────────────────────────────
-        gl.emit_event("BetMatched", {
-            "bet_id": int(bet_id),
-            "taker":  str(gl.message.sender),
-            "amount": bet["amount"],
-        })
-
-    # ─────────────────────────────────────────────────────────────────────────
-
     @gl.public.write
-    async def resolve_bet(self, bet_id: u256) -> None:
-        """
-        Trigger AI resolution after the deadline.
-
-        Optimistic Phase: single validator proposes a winner.
-        Result is PROPOSED — a 5-minute challenge window opens.
-        If the AI returns 'invalid', both parties are refunded immediately.
-
-        Events emitted: BetResolved
-        """
+    def resolve_bet(self, bet_id: u256) -> None:
+        """Trigger AI resolution after the deadline (Optimistic Phase)."""
         bet = self._get_bet(bet_id)
 
-        # ── Validations ───────────────────────────────────────────────────────
-        require(bet["status"] == MATCHED,
-                "Bet must be in MATCHED status to resolve")
-        require(int(gl.message.timestamp) >= bet["deadline"],
-                "Deadline has not been reached yet")
+        if bet["status"] != MATCHED:
+            raise Exception("Bet must be in MATCHED status to resolve")
+        if _now_unix() < bet["deadline"]:
+            raise Exception("Deadline has not been reached yet")
 
-        # ── AI Oracle — Optimistic Phase (1 validator, temperature=0) ─────────
-        winner_key   = await self._call_oracle(bet, num_validators=1)
+        winner_key    = self._call_oracle(bet)
         proposed_addr = self._address_of(bet, winner_key)
 
         if proposed_addr is None:
-            # ── INVALID: cancel and refund both parties ────────────────────
-            # CEI: update state BEFORE transferring funds (reentrancy safe)
             bet["status"] = CANCELLED
             self._save_bet(bet_id, bet)
-
             gl.transfer(bet["maker"], bet["amount"])
             gl.transfer(bet["taker"], bet["amount"])
-
-            gl.emit_event("BetResolved", {
-                "bet_id": int(bet_id),
-                "winner": None,
-                "status": CANCELLED,
-                "phase":  "optimistic",
-            })
             return
 
-        # ── Effects: record proposal, open challenge window ───────────────────
         bet["proposed_winner"] = proposed_addr
-        bet["proposed_at"]     = int(gl.message.timestamp)
+        bet["proposed_at"]     = _now_unix()
         bet["status"]          = PROPOSED
         self._save_bet(bet_id, bet)
 
-        # ── Event ─────────────────────────────────────────────────────────────
-        gl.emit_event("BetResolved", {
-            "bet_id":          int(bet_id),
-            "proposed_winner": proposed_addr,
-            "status":          PROPOSED,
-            "phase":           "optimistic",
-        })
-
-    # ─────────────────────────────────────────────────────────────────────────
-
     @gl.public.write
-    async def dispute_bet(self, bet_id: u256) -> None:
-        """
-        Dispute a proposed result within the 5-minute challenge window.
-
-        Democracy Phase: DEMOCRACY_NODES validators re-evaluate the bet.
-        The multi-node consensus overrides the optimistic proposal.
-        Prize is transferred immediately upon democratic settlement.
-
-        Events emitted: BetResolved
-        """
+    def dispute_bet(self, bet_id: u256) -> None:
+        """Dispute a proposed result within the 5-minute challenge window."""
         bet = self._get_bet(bet_id)
 
-        # ── Validations ───────────────────────────────────────────────────────
-        require(bet["status"] == PROPOSED,
-                "Bet is not in PROPOSED state — cannot dispute")
-        require(
-            str(gl.message.sender) in (bet["maker"], bet["taker"]),
-            "Only Maker or Taker can dispute",
-        )
-        elapsed = int(gl.message.timestamp) - bet["proposed_at"]
-        require(elapsed <= DISPUTE_WINDOW_SECS,
-                "Dispute window has expired (5-minute limit)")
+        if bet["status"] != PROPOSED:
+            raise Exception("Bet is not in PROPOSED state — cannot dispute")
+        sender = str(gl.message.sender_address)
+        if sender not in (bet["maker"], bet["taker"]):
+            raise Exception("Only Maker or Taker can dispute")
+        elapsed = _now_unix() - bet["proposed_at"]
+        if elapsed > DISPUTE_WINDOW_SECS:
+            raise Exception("Dispute window has expired (5-minute limit)")
 
-        # ── Effects: mark DISPUTED before external call (reentrancy guard) ────
         bet["status"] = DISPUTED
         self._save_bet(bet_id, bet)
 
-        # ── AI Oracle — Democracy Phase (DEMOCRACY_NODES validators) ──────────
-        winner_key = await self._call_oracle(bet, num_validators=DEMOCRACY_NODES)
+        winner_key = self._call_oracle(bet)
         final_addr = self._address_of(bet, winner_key)
 
         if final_addr is None:
-            # Democracy also finds the bet invalid → cancel and refund
             bet["status"] = CANCELLED
             self._save_bet(bet_id, bet)
-
             gl.transfer(bet["maker"], bet["amount"])
             gl.transfer(bet["taker"], bet["amount"])
-
-            gl.emit_event("BetResolved", {
-                "bet_id": int(bet_id),
-                "winner": None,
-                "status": CANCELLED,
-                "phase":  "democracy",
-            })
             return
 
-        # ── Effects: record democratic verdict ────────────────────────────────
         bet["proposed_winner"] = final_addr
         bet["status"]          = SETTLED
         self._save_bet(bet_id, bet)
-
-        # ── Interactions: transfer full pool AFTER state update ───────────────
         gl.transfer(final_addr, bet["amount"] * 2)
-
-        gl.emit_event("BetResolved", {
-            "bet_id": int(bet_id),
-            "winner": final_addr,
-            "status": SETTLED,
-            "phase":  "democracy",
-        })
-
-    # ─────────────────────────────────────────────────────────────────────────
 
     @gl.public.write
     def claim_prize(self, bet_id: u256) -> None:
-        """
-        Claim the full prize pool (amount × 2).
-
-        Allowed only if:
-          - status == PROPOSED  AND  ≥ 5 minutes have elapsed with no dispute.
-
-        The CEI pattern guarantees reentrancy safety:
-          1. CHECK  — verify status and timing.
-          2. EFFECT — update status to SETTLED.
-          3. INTERACT — transfer funds.
-
-        Events emitted: PrizeClaimed
-        """
+        """Claim prize after dispute window expires with no challenge."""
         bet = self._get_bet(bet_id)
 
-        # ── Checks ────────────────────────────────────────────────────────────
-        require(
-            bet["status"] == PROPOSED,
-            "Bet is not claimable: must be PROPOSED with no active dispute "
-            "(democracy-settled bets are paid out directly by dispute_bet)",
-        )
+        if bet["status"] != PROPOSED:
+            raise Exception("Bet is not claimable: must be PROPOSED with no active dispute")
 
-        elapsed = int(gl.message.timestamp) - bet["proposed_at"]
-        require(
-            elapsed >= DISPUTE_WINDOW_SECS,
-            f"Dispute window has not expired yet — wait {DISPUTE_WINDOW_SECS - elapsed}s",
-        )
+        elapsed = _now_unix() - bet["proposed_at"]
+        if elapsed < DISPUTE_WINDOW_SECS:
+            raise Exception(f"Dispute window has not expired yet")
 
         winner = bet["proposed_winner"]
-        require(winner is not None, "No winner determined")
+        if winner is None:
+            raise Exception("No winner determined")
 
-        # ── Effects: update state BEFORE transfer (reentrancy safe) ──────────
         bet["status"] = SETTLED
         self._save_bet(bet_id, bet)
-
-        # ── Interactions: single transfer point for the happy path ────────────
-        payout = bet["amount"] * 2
-        gl.transfer(winner, payout)
-
-        gl.emit_event("PrizeClaimed", {
-            "bet_id": int(bet_id),
-            "winner": winner,
-            "payout": payout,
-        })
+        gl.transfer(winner, bet["amount"] * 2)
 
     # =========================================================================
-    # PUBLIC VIEW FUNCTIONS (read-only, no gas for pure queries)
+    # PUBLIC VIEW FUNCTIONS
     # =========================================================================
 
     @gl.public.view
     def get_bet(self, bet_id: u256) -> dict:
-        """Return all fields of a single bet."""
         return self._get_bet(bet_id)
 
     @gl.public.view
     def get_bet_count(self) -> u256:
-        """Return the total number of bets ever created."""
         return self.bet_count
 
     @gl.public.view
     def get_open_bets(self) -> list:
-        """Return all OPEN bets — used by the frontend marketplace."""
         result = []
         for i in range(int(self.bet_count)):
             bet = self.bets[u256(i)]
@@ -407,7 +268,6 @@ class FairStake(gl.Contract):
 
     @gl.public.view
     def get_bets_by_address(self, addr: str) -> list:
-        """Return all bets where the address is Maker or Taker (My Bets view)."""
         result = []
         for i in range(int(self.bet_count)):
             bet = self.bets[u256(i)]
